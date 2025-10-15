@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -15,8 +14,218 @@
 
 #define STACK_SIZE (1024 * 1024)
 #define CONTAINER_ROOT "/tmp/container_root"
+#define CGROUP_ROOT "/sys/fs/cgroup"
+#define CGROUP_NAME "docker_in_c_container"
 
 static char child_stack[STACK_SIZE];
+
+// 資源限制配置結構
+typedef struct {
+    long memory_limit_mb;      // 記憶體限制 (MB)
+    int cpu_shares;            // CPU 份額 (預設 1024)
+    int cpu_quota_us;          // CPU 配額 (微秒/100ms週期)
+    int pids_max;              // 最大進程數
+} cgroup_limits_t;
+
+// 寫入 cgroup 檔案的輔助函數
+int write_cgroup_file(const char* cgroup_path, const char* filename, const char* value) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", cgroup_path, filename);
+    
+    FILE* file = fopen(path, "w");
+    if (!file) {
+        fprintf(stderr, "警告: 無法打開 %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    
+    if (fprintf(file, "%s", value) < 0) {
+        fprintf(stderr, "警告: 無法寫入 %s: %s\n", path, strerror(errno));
+        fclose(file);
+        return -1;
+    }
+    
+    fclose(file);
+    return 0;
+}
+
+// 檢測 cgroup 版本 (v1 或 v2)
+int detect_cgroup_version() {
+    struct stat st;
+    // 如果存在 cgroup.controllers 檔案，則為 cgroup v2
+    if (stat("/sys/fs/cgroup/cgroup.controllers", &st) == 0) {
+        return 2;
+    }
+    // 如果存在 memory 子系統目錄，則為 cgroup v1
+    if (stat("/sys/fs/cgroup/memory", &st) == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+// 創建並配置 cgroup v2
+int setup_cgroup_v2(pid_t pid, const cgroup_limits_t* limits) {
+    char cgroup_path[512];
+    char buffer[128];
+    
+    printf("正在設置資源限制 (cgroup v2)...\n");
+    
+    // 創建 cgroup 目錄
+    snprintf(cgroup_path, sizeof(cgroup_path), "%s/%s", CGROUP_ROOT, CGROUP_NAME);
+    if (mkdir(cgroup_path, 0755) == -1 && errno != EEXIST) {
+        fprintf(stderr, "警告: 無法創建 cgroup 目錄: %s\n", strerror(errno));
+        return -1;
+    }
+    
+    // 先將進程移入 cgroup（在設置限制之前）
+    // 這樣可以避免某些系統上的權限問題
+    snprintf(buffer, sizeof(buffer), "%d", pid);
+    write_cgroup_file(cgroup_path, "cgroup.procs", buffer);
+    
+    // 嘗試在根 cgroup 中啟用控制器
+    // 注意：這可能會失敗，但不影響基本功能
+    write_cgroup_file(CGROUP_ROOT, "cgroup.subtree_control", "+cpu +memory +pids");
+    
+    // 設置記憶體限制
+    if (limits->memory_limit_mb > 0) {
+        snprintf(buffer, sizeof(buffer), "%ld", limits->memory_limit_mb * 1024 * 1024);
+        if (write_cgroup_file(cgroup_path, "memory.max", buffer) == 0) {
+            printf("  記憶體限制: %ld MB\n", limits->memory_limit_mb);
+        }
+    }
+    
+    // 設置 CPU 權重 (cgroup v2 使用 weight 代替 shares)
+    if (limits->cpu_shares > 0) {
+        // 將 shares (範圍 2-262144) 轉換為 weight (範圍 1-10000)
+        int weight = (limits->cpu_shares * 10000) / 1024;
+        if (weight < 1) weight = 1;
+        if (weight > 10000) weight = 10000;
+        
+        snprintf(buffer, sizeof(buffer), "%d", weight);
+        if (write_cgroup_file(cgroup_path, "cpu.weight", buffer) == 0) {
+            printf("  CPU 權重: %d (shares: %d)\n", weight, limits->cpu_shares);
+        }
+    }
+    
+    // 設置 CPU 配額
+    if (limits->cpu_quota_us > 0) {
+        snprintf(buffer, sizeof(buffer), "%d 100000", limits->cpu_quota_us);
+        if (write_cgroup_file(cgroup_path, "cpu.max", buffer) == 0) {
+            printf("  CPU 配額: %d us / 100000 us (%.1f%%)\n", 
+                   limits->cpu_quota_us, (limits->cpu_quota_us / 1000.0));
+        }
+    }
+    
+    // 設置進程數限制
+    if (limits->pids_max > 0) {
+        snprintf(buffer, sizeof(buffer), "%d", limits->pids_max);
+        if (write_cgroup_file(cgroup_path, "pids.max", buffer) == 0) {
+            printf("  最大進程數: %d\n", limits->pids_max);
+        }
+    }
+    
+    printf("  已將進程 %d 加入 cgroup\n", pid);
+    
+    return 0;
+}
+
+// 創建並配置 cgroup v1
+int setup_cgroup_v1(pid_t pid, const cgroup_limits_t* limits) {
+    char cgroup_path[512];
+    char buffer[128];
+    
+    printf("正在設置資源限制 (cgroup v1)...\n");
+    
+    // 設置記憶體限制
+    if (limits->memory_limit_mb > 0) {
+        snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/memory/%s", CGROUP_NAME);
+        if (mkdir(cgroup_path, 0755) == -1 && errno != EEXIST) {
+            fprintf(stderr, "警告: 無法創建 memory cgroup: %s\n", strerror(errno));
+        } else {
+            snprintf(buffer, sizeof(buffer), "%ld", limits->memory_limit_mb * 1024 * 1024);
+            write_cgroup_file(cgroup_path, "memory.limit_in_bytes", buffer);
+            
+            snprintf(buffer, sizeof(buffer), "%d", pid);
+            write_cgroup_file(cgroup_path, "tasks", buffer);
+            printf("  記憶體限制: %ld MB\n", limits->memory_limit_mb);
+        }
+    }
+    
+    // 設置 CPU 限制
+    if (limits->cpu_shares > 0 || limits->cpu_quota_us > 0) {
+        snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/cpu/%s", CGROUP_NAME);
+        if (mkdir(cgroup_path, 0755) == -1 && errno != EEXIST) {
+            fprintf(stderr, "警告: 無法創建 cpu cgroup: %s\n", strerror(errno));
+        } else {
+            if (limits->cpu_shares > 0) {
+                snprintf(buffer, sizeof(buffer), "%d", limits->cpu_shares);
+                write_cgroup_file(cgroup_path, "cpu.shares", buffer);
+                printf("  CPU 份額: %d\n", limits->cpu_shares);
+            }
+            
+            if (limits->cpu_quota_us > 0) {
+                snprintf(buffer, sizeof(buffer), "%d", limits->cpu_quota_us);
+                write_cgroup_file(cgroup_path, "cpu.cfs_quota_us", buffer);
+                printf("  CPU 配額: %d us / 100000 us (%.1f%%)\n", 
+                       limits->cpu_quota_us, (limits->cpu_quota_us / 1000.0));
+            }
+            
+            snprintf(buffer, sizeof(buffer), "%d", pid);
+            write_cgroup_file(cgroup_path, "tasks", buffer);
+        }
+    }
+    
+    // 設置進程數限制
+    if (limits->pids_max > 0) {
+        snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/pids/%s", CGROUP_NAME);
+        if (mkdir(cgroup_path, 0755) == -1 && errno != EEXIST) {
+            fprintf(stderr, "警告: 無法創建 pids cgroup: %s\n", strerror(errno));
+        } else {
+            snprintf(buffer, sizeof(buffer), "%d", limits->pids_max);
+            write_cgroup_file(cgroup_path, "pids.max", buffer);
+            
+            snprintf(buffer, sizeof(buffer), "%d", pid);
+            write_cgroup_file(cgroup_path, "tasks", buffer);
+            printf("  最大進程數: %d\n", limits->pids_max);
+        }
+    }
+    
+    return 0;
+}
+
+// 設置 cgroup 資源限制
+int setup_cgroup_limits(pid_t pid, const cgroup_limits_t* limits) {
+    int cgroup_version = detect_cgroup_version();
+    
+    if (cgroup_version == 0) {
+        fprintf(stderr, "警告: 未檢測到 cgroup 支援，資源限制將不生效\n");
+        return -1;
+    }
+    
+    if (cgroup_version == 2) {
+        return setup_cgroup_v2(pid, limits);
+    } else {
+        return setup_cgroup_v1(pid, limits);
+    }
+}
+
+// 清理 cgroup
+void cleanup_cgroup() {
+    int cgroup_version = detect_cgroup_version();
+    char cgroup_path[512];
+    
+    if (cgroup_version == 2) {
+        snprintf(cgroup_path, sizeof(cgroup_path), "%s/%s", CGROUP_ROOT, CGROUP_NAME);
+        rmdir(cgroup_path);
+    } else if (cgroup_version == 1) {
+        // 清理各個子系統的 cgroup
+        char* subsystems[] = {"memory", "cpu", "pids", NULL};
+        for (int i = 0; subsystems[i]; i++) {
+            snprintf(cgroup_path, sizeof(cgroup_path), 
+                     "/sys/fs/cgroup/%s/%s", subsystems[i], CGROUP_NAME);
+            rmdir(cgroup_path);
+        }
+    }
+}
 
 
 void terminfo_copy(){
@@ -221,8 +430,44 @@ void set_alias(){
     
 }
 
+// 創建虛擬的 meminfo 文件以反映 cgroup 限制（在 chroot 後調用）
+void create_virtual_meminfo_after_chroot(long memory_limit_mb) {
+    // 在 /tmp 中創建虛擬 meminfo（tmpfs，可寫）
+    FILE* meminfo = fopen("/tmp/meminfo.custom", "w");
+    if (!meminfo) {
+        fprintf(stderr, "警告: 無法創建虛擬 meminfo\n");
+        return;
+    }
+    
+    // 計算以 KB 為單位的記憶體值
+    long mem_total_kb = memory_limit_mb * 1024;
+    long mem_free_kb = mem_total_kb * 80 / 100;  // 假設 80% 可用
+    long mem_available_kb = mem_total_kb * 75 / 100;
+    
+    // 創建簡化的 meminfo，包含 free 命令需要的關鍵字段
+    fprintf(meminfo, "MemTotal:       %ld kB\n", mem_total_kb);
+    fprintf(meminfo, "MemFree:        %ld kB\n", mem_free_kb);
+    fprintf(meminfo, "MemAvailable:   %ld kB\n", mem_available_kb);
+    fprintf(meminfo, "Buffers:             0 kB\n");
+    fprintf(meminfo, "Cached:              0 kB\n");
+    fprintf(meminfo, "SwapCached:          0 kB\n");
+    fprintf(meminfo, "Active:              0 kB\n");
+    fprintf(meminfo, "Inactive:            0 kB\n");
+    fprintf(meminfo, "SwapTotal:           0 kB\n");
+    fprintf(meminfo, "SwapFree:            0 kB\n");
+    fprintf(meminfo, "Dirty:               0 kB\n");
+    fprintf(meminfo, "Writeback:           0 kB\n");
+    fprintf(meminfo, "Shmem:               0 kB\n");
+    fprintf(meminfo, "Slab:                0 kB\n");
+    fprintf(meminfo, "SReclaimable:        0 kB\n");
+    fprintf(meminfo, "SUnreclaim:          0 kB\n");
+    
+    fclose(meminfo);
+}
+
 // 容器初始化函數
 int container_init(void* arg) {
+    cgroup_limits_t* limits = (cgroup_limits_t*)arg;
     // 使用 -i 參數強制 bash 進入交互模式
     char *argv[] = {"/bin/bash", "-i", NULL};
     char *envp[] = {
@@ -295,6 +540,13 @@ int container_init(void* arg) {
         {"/bin/tail", "tail"},
         {"/bin/sort", "sort"},
         {"/bin/uniq", "uniq"},
+        {"/bin/dd", "dd"},
+        {"/usr/bin/yes", "yes"},
+        {"/usr/bin/seq", "seq"},
+        {"/usr/bin/bc", "bc"},
+        {"/usr/bin/tr", "tr"},
+        {"/usr/bin/awk", "awk"},
+        {"/usr/bin/sed", "sed"},
         {"/usr/bin/id", "id"},
         {"/usr/bin/whoami", "whoami"},
         {"/usr/bin/which", "which"},
@@ -352,7 +604,6 @@ int container_init(void* arg) {
 
     vim_copy();
     
-    
     // 文件系統隔離：改變根目錄並切換工作目錄
     // chroot: 將進程的根目錄改為容器目錄，實現文件系統隔離
     // chdir: 切換到新的根目錄，避免工作目錄錯誤
@@ -364,6 +615,20 @@ int container_init(void* arg) {
     // 掛載 proc 和 sys 文件系統
     if (mount("proc", "/proc", "proc", 0, NULL) == -1 || mount("sysfs", "/sys", "sysfs", 0, NULL) == -1) {
         printf("警告: 無法掛載 /proc (某些指令如 top 可能無法正常工作)\n");
+    }
+    
+    // 創建並掛載虛擬 meminfo（在 chroot 和 mount proc 之後）
+    if (limits && limits->memory_limit_mb > 0) {
+        // 創建虛擬 meminfo 文件
+        create_virtual_meminfo_after_chroot(limits->memory_limit_mb);
+        
+        // 使用 bind mount 將虛擬 meminfo 掛載到 /proc/meminfo
+        if (mount("/tmp/meminfo.custom", "/proc/meminfo", NULL, MS_BIND, NULL) == -1) {
+            printf("警告: 無法掛載虛擬 meminfo: %s\n", strerror(errno));
+            printf("     (free 命令將顯示主機記憶體，但 cgroup 限制仍然生效)\n");
+        } else {
+            printf("✓ 已設置虛擬記憶體視圖 (%ld MB)\n", limits->memory_limit_mb);
+        }
     }
     
     
@@ -396,6 +661,14 @@ int main() {
     printf("=== 簡單容器實現 ===\n");
     printf("正在創建容器...\n");
     
+    // 配置資源限制
+    static cgroup_limits_t limits = {
+        .memory_limit_mb = 512,    // 限制記憶體為 512 MB
+        .cpu_shares = 512,         // CPU 份額為 512 (預設的一半)
+        .cpu_quota_us = 50000,     // CPU 配額為 50% (50000/100000)
+        .pids_max = 100            // 最多 100 個進程
+    };
+    
     // 創建子進程，使用新的命名空間
     pid_t pid = clone(container_init, 
                       child_stack + STACK_SIZE,
@@ -404,15 +677,18 @@ int main() {
                       CLONE_NEWUTS |    // 新的主機名命名空間
                       CLONE_NEWIPC |    // 新的 IPC 命名空間
                       SIGCHLD,          // 子進程結束時發送 SIGCHLD
-                      NULL);
+                      &limits);         // 傳遞限制配置
     
     if (pid == -1) {
         perror("clone");
         exit(EXIT_FAILURE);
     }
     
-    printf("容器已創建，PID: %d\n", pid);
-
+    printf("容器已創建，PID: %d\n\n", pid);
+    
+    // 設置資源限制
+    setup_cgroup_limits(pid, &limits);
+    printf("\n");
     
     // 等待子進程結束
     int status;
@@ -422,6 +698,9 @@ int main() {
     }
     
     printf("容器已退出\n");
+    
+    // 清理 cgroup
+    cleanup_cgroup();
     
     // 清理容器目錄
     if (system("rm -rf " CONTAINER_ROOT) == -1) {
