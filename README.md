@@ -23,29 +23,6 @@ make
 ```bash
 sudo ./main
 ```
-
-注意：需要 root 權限來創建命名空間和執行 chroot。
-
-### 首次使用
-
-如果遇到 cgroup 相關警告（特別是 CPU 控制器），請參考：
-- **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** - 疑難排解指南
-- **[CGROUPS_GUIDE.md](CGROUPS_GUIDE.md)** - Cgroups 使用指南
-
-或運行設置腳本：
-```bash
-sudo ./setup_cgroup.sh
-```
-
-### 測試資源限制
-
-在另一個終端中，當容器運行時：
-```bash
-sudo ./test_limits.sh
-```
-
-此腳本會顯示哪些資源限制實際生效。
-
 ## 已安裝的指令
 
 ### 基本文件操作
