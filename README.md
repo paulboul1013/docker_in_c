@@ -8,6 +8,7 @@
 - ✅ **文件系統隔離**: 使用 chroot 和掛載命名空間
 - ✅ **主機名隔離**: 使用 UTS 命名空間
 - ✅ **IPC 隔離**: 使用 IPC 命名空間
+- ✅ **資源限制**: 使用 cgroups 限制 CPU、記憶體和進程數
 - ✅ **完整的基本指令集**: ls, cat, ps, top, htop, grep, find, vim, nano, man 等
 - ✅ **終端支援**: 完整的 terminfo 和 devpts 支援
 
@@ -24,6 +25,26 @@ sudo ./main
 ```
 
 注意：需要 root 權限來創建命名空間和執行 chroot。
+
+### 首次使用
+
+如果遇到 cgroup 相關警告（特別是 CPU 控制器），請參考：
+- **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** - 疑難排解指南
+- **[CGROUPS_GUIDE.md](CGROUPS_GUIDE.md)** - Cgroups 使用指南
+
+或運行設置腳本：
+```bash
+sudo ./setup_cgroup.sh
+```
+
+### 測試資源限制
+
+在另一個終端中，當容器運行時：
+```bash
+sudo ./test_limits.sh
+```
+
+此腳本會顯示哪些資源限制實際生效。
 
 ## 已安裝的指令
 
@@ -51,32 +72,74 @@ sudo ./main
 ## 實現原理
 
 1. 使用 `clone()` 系統調用創建帶有新命名空間的子進程
-2. 在子進程中設置容器根目錄和基本文件系統結構
-3. 使用 `chroot()` 改變根目錄實現文件系統隔離
-4. 掛載必要的文件系統（proc, sys, devpts）
-5. 執行 /bin/bash
+2. 設置 cgroups 資源限制（CPU、記憶體、進程數）
+3. 在子進程中設置容器根目錄和基本文件系統結構
+4. 使用 `chroot()` 改變根目錄實現文件系統隔離
+5. 掛載必要的文件系統（proc, sys, devpts）
+6. 執行 /bin/bash
 
 ## 技術細節
 
 - **命名空間**: CLONE_NEWPID, CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWIPC
+- **資源限制**: cgroups v1/v2 自動檢測和配置
+  - 記憶體限制: 512 MB
+  - CPU 配額: 50% (可配置)
+  - 最大進程數: 100
 - **文件系統隔離**: chroot + mount
 - **終端設備**: /dev/pts, /dev/tty, /dev/console
 - **依賴複製**: 自動複製二進制文件及其依賴庫
+
+## 資源限制配置
+
+程式會自動檢測系統使用的 cgroup 版本（v1 或 v2），並相應配置資源限制。
+
+### 預設限制
+
+```c
+cgroup_limits_t limits = {
+    .memory_limit_mb = 512,    // 記憶體限制 512 MB
+    .cpu_shares = 512,         // CPU 份額（預設 1024 的一半）
+    .cpu_quota_us = 50000,     // CPU 配額 50%
+    .pids_max = 100            // 最多 100 個進程
+};
+```
+
+### 自訂限制
+
+您可以在 `main.c` 的 `main()` 函數中修改 `cgroup_limits_t` 結構來調整資源限制：
+
+- **memory_limit_mb**: 記憶體限制（MB），設為 0 表示不限制
+- **cpu_shares**: CPU 份額（範圍 2-262144，預設 1024）
+- **cpu_quota_us**: CPU 配額（微秒/100ms），50000 = 50%
+- **pids_max**: 最大進程數，設為 0 表示不限制
+
+### 驗證資源限制
+
+進入容器後，可以使用以下指令查看資源使用情況：
+
+```bash
+# 查看記憶體使用
+free -h
+
+# 查看進程列表
+ps aux
+
+# 查看系統資源
+top
+```
 
 ## 限制
 
 這是一個簡化的實現，不包含以下功能：
 - 網路隔離（CLONE_NEWNET）
-- 資源限制（cgroups）
 - 用戶命名空間（CLONE_NEWUSER）
 - 安全性加強（seccomp, AppArmor）
 - 鏡像管理
+- 持久化存儲（volumes）
 
 ## 作者
 
 paulboul1013
 
-## 許可證
 
-MIT License
 
