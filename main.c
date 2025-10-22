@@ -11,11 +11,12 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <time.h>
 
 #define STACK_SIZE (1024 * 1024)
-#define CONTAINER_ROOT "/tmp/container_root"
+#define CONTAINER_ROOT_PREFIX "/tmp/container_root_"
 #define CGROUP_ROOT "/sys/fs/cgroup"
-#define CGROUP_NAME "docker_in_c_container"
+#define CGROUP_NAME_PREFIX "docker_in_c_container_"
 
 static char child_stack[STACK_SIZE];
 
@@ -26,6 +27,15 @@ typedef struct {
     int cpu_quota_us;          // CPU 配額 (微秒/100ms週期)
     int pids_max;              // 最大進程數
 } cgroup_limits_t;
+
+// 容器初始化參數結構
+typedef struct {
+    cgroup_limits_t* limits;
+    int sync_pipe[2];          // 用於父子進程同步的管道
+    char container_root[256];  // 容器根目錄路徑
+    char cgroup_name[128];     // cgroup 名稱
+    int container_id;          // 容器 ID
+} container_init_args_t;
 
 // 寫入 cgroup 檔案的輔助函數
 int write_cgroup_file(const char* cgroup_path, const char* filename, const char* value) {
@@ -63,14 +73,14 @@ int detect_cgroup_version() {
 }
 
 // 創建並配置 cgroup v2
-int setup_cgroup_v2(pid_t pid, const cgroup_limits_t* limits) {
+int setup_cgroup_v2(pid_t pid, const cgroup_limits_t* limits, const char* cgroup_name) {
     char cgroup_path[512];
     char buffer[128];
     
     printf("正在設置資源限制 (cgroup v2)...\n");
     
     // 創建 cgroup 目錄
-    snprintf(cgroup_path, sizeof(cgroup_path), "%s/%s", CGROUP_ROOT, CGROUP_NAME);
+    snprintf(cgroup_path, sizeof(cgroup_path), "%s/%s", CGROUP_ROOT, cgroup_name);
     if (mkdir(cgroup_path, 0755) == -1 && errno != EEXIST) {
         fprintf(stderr, "警告: 無法創建 cgroup 目錄: %s\n", strerror(errno));
         return -1;
@@ -129,7 +139,7 @@ int setup_cgroup_v2(pid_t pid, const cgroup_limits_t* limits) {
 }
 
 // 創建並配置 cgroup v1
-int setup_cgroup_v1(pid_t pid, const cgroup_limits_t* limits) {
+int setup_cgroup_v1(pid_t pid, const cgroup_limits_t* limits, const char* cgroup_name) {
     char cgroup_path[512];
     char buffer[128];
     
@@ -137,7 +147,7 @@ int setup_cgroup_v1(pid_t pid, const cgroup_limits_t* limits) {
     
     // 設置記憶體限制
     if (limits->memory_limit_mb > 0) {
-        snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/memory/%s", CGROUP_NAME);
+        snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/memory/%s", cgroup_name);
         if (mkdir(cgroup_path, 0755) == -1 && errno != EEXIST) {
             fprintf(stderr, "警告: 無法創建 memory cgroup: %s\n", strerror(errno));
         } else {
@@ -152,7 +162,7 @@ int setup_cgroup_v1(pid_t pid, const cgroup_limits_t* limits) {
     
     // 設置 CPU 限制
     if (limits->cpu_shares > 0 || limits->cpu_quota_us > 0) {
-        snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/cpu/%s", CGROUP_NAME);
+        snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/cpu/%s", cgroup_name);
         if (mkdir(cgroup_path, 0755) == -1 && errno != EEXIST) {
             fprintf(stderr, "警告: 無法創建 cpu cgroup: %s\n", strerror(errno));
         } else {
@@ -176,7 +186,7 @@ int setup_cgroup_v1(pid_t pid, const cgroup_limits_t* limits) {
     
     // 設置進程數限制
     if (limits->pids_max > 0) {
-        snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/pids/%s", CGROUP_NAME);
+        snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/pids/%s", cgroup_name);
         if (mkdir(cgroup_path, 0755) == -1 && errno != EEXIST) {
             fprintf(stderr, "警告: 無法創建 pids cgroup: %s\n", strerror(errno));
         } else {
@@ -193,7 +203,7 @@ int setup_cgroup_v1(pid_t pid, const cgroup_limits_t* limits) {
 }
 
 // 設置 cgroup 資源限制
-int setup_cgroup_limits(pid_t pid, const cgroup_limits_t* limits) {
+int setup_cgroup_limits(pid_t pid, const cgroup_limits_t* limits, const char* cgroup_name) {
     int cgroup_version = detect_cgroup_version();
     
     if (cgroup_version == 0) {
@@ -202,160 +212,320 @@ int setup_cgroup_limits(pid_t pid, const cgroup_limits_t* limits) {
     }
     
     if (cgroup_version == 2) {
-        return setup_cgroup_v2(pid, limits);
+        return setup_cgroup_v2(pid, limits, cgroup_name);
     } else {
-        return setup_cgroup_v1(pid, limits);
+        return setup_cgroup_v1(pid, limits, cgroup_name);
     }
 }
 
 // 清理 cgroup
-void cleanup_cgroup() {
+void cleanup_cgroup(const char* cgroup_name) {
     int cgroup_version = detect_cgroup_version();
     char cgroup_path[512];
     
     if (cgroup_version == 2) {
-        snprintf(cgroup_path, sizeof(cgroup_path), "%s/%s", CGROUP_ROOT, CGROUP_NAME);
+        snprintf(cgroup_path, sizeof(cgroup_path), "%s/%s", CGROUP_ROOT, cgroup_name);
         rmdir(cgroup_path);
     } else if (cgroup_version == 1) {
         // 清理各個子系統的 cgroup
         char* subsystems[] = {"memory", "cpu", "pids", NULL};
         for (int i = 0; subsystems[i]; i++) {
             snprintf(cgroup_path, sizeof(cgroup_path), 
-                     "/sys/fs/cgroup/%s/%s", subsystems[i], CGROUP_NAME);
+                     "/sys/fs/cgroup/%s/%s", subsystems[i], cgroup_name);
             rmdir(cgroup_path);
         }
     }
 }
 
+// 獲取真實用戶 UID（即使在 sudo 下運行）
+uid_t get_real_uid() {
+    char *sudo_uid = getenv("SUDO_UID");
+    if (sudo_uid) {
+        return (uid_t)atoi(sudo_uid);
+    }
+    return getuid();
+}
 
-void terminfo_copy(){
+// 獲取真實用戶 GID（即使在 sudo 下運行）
+gid_t get_real_gid() {
+    char *sudo_gid = getenv("SUDO_GID");
+    if (sudo_gid) {
+        return (gid_t)atoi(sudo_gid);
+    }
+    return getgid();
+}
+
+// 設置用戶命名空間的 UID/GID 映射
+int setup_user_namespace(pid_t pid) {
+    char path[256];
+    char mapping[256];
+    FILE *file;
+    uid_t real_uid = get_real_uid();
+    gid_t real_gid = get_real_gid();
+    
+    printf("正在設置用戶命名空間映射...\n");
+    
+    // 禁用 setgroups（安全要求）
+    snprintf(path, sizeof(path), "/proc/%d/setgroups", pid);
+    file = fopen(path, "w");
+    if (file) {
+        fprintf(file, "deny");
+        fclose(file);
+    } else {
+        fprintf(stderr, "警告: 無法禁用 setgroups: %s\n", strerror(errno));
+    }
+    
+    // 設置 UID 映射：將容器內的 root (UID 0) 映射到主機真實用戶
+    snprintf(path, sizeof(path), "/proc/%d/uid_map", pid);
+    snprintf(mapping, sizeof(mapping), "0 %d 1", real_uid);
+    
+    file = fopen(path, "w");
+    if (!file) {
+        fprintf(stderr, "錯誤: 無法打開 uid_map: %s\n", strerror(errno));
+        return -1;
+    }
+    
+    if (fprintf(file, "%s", mapping) < 0) {
+        fprintf(stderr, "錯誤: 無法寫入 uid_map: %s\n", strerror(errno));
+        fclose(file);
+        return -1;
+    }
+    fclose(file);
+    printf("  UID 映射: 容器 0 -> 主機 %d\n", real_uid);
+    
+    // 設置 GID 映射
+    snprintf(path, sizeof(path), "/proc/%d/gid_map", pid);
+    snprintf(mapping, sizeof(mapping), "0 %d 1", real_gid);
+    
+    file = fopen(path, "w");
+    if (!file) {
+        fprintf(stderr, "錯誤: 無法打開 gid_map: %s\n", strerror(errno));
+        return -1;
+    }
+    
+    if (fprintf(file, "%s", mapping) < 0) {
+        fprintf(stderr, "錯誤: 無法寫入 gid_map: %s\n", strerror(errno));
+        fclose(file);
+        return -1;
+    }
+    fclose(file);
+    printf("  GID 映射: 容器 0 -> 主機 %d\n", real_gid);
+    
+    return 0;
+}
+
+
+void terminfo_copy(const char* container_root){
      // 複製 terminfo 資料庫
-    //  printf("正在安裝終端支援...\n");
+     char cmd[1024];
      
      // 嘗試從多個可能的位置複製 terminfo
-     system("cp -r /lib/terminfo " CONTAINER_ROOT "/lib/ 2>/dev/null || true");
-     system("cp -r /etc/terminfo " CONTAINER_ROOT "/etc/ 2>/dev/null || true");
+     snprintf(cmd, sizeof(cmd), "cp -r /lib/terminfo %s/lib/ 2>/dev/null || true", container_root);
+     system(cmd);
+     snprintf(cmd, sizeof(cmd), "cp -r /etc/terminfo %s/etc/ 2>/dev/null || true", container_root);
+     system(cmd);
      
      // 從 /usr/share/terminfo 複製
-     system("cp /usr/share/terminfo/l/linux " CONTAINER_ROOT "/usr/share/terminfo/l/ 2>/dev/null || true");
-     system("cp /usr/share/terminfo/x/xterm " CONTAINER_ROOT "/usr/share/terminfo/x/ 2>/dev/null || true");
-     system("cp /usr/share/terminfo/x/xterm-256color " CONTAINER_ROOT "/usr/share/terminfo/x/ 2>/dev/null || true");
-     system("cp /usr/share/terminfo/v/vt100 " CONTAINER_ROOT "/usr/share/terminfo/v/ 2>/dev/null || true");
+     snprintf(cmd, sizeof(cmd), "cp /usr/share/terminfo/l/linux %s/usr/share/terminfo/l/ 2>/dev/null || true", container_root);
+     system(cmd);
+     snprintf(cmd, sizeof(cmd), "cp /usr/share/terminfo/x/xterm %s/usr/share/terminfo/x/ 2>/dev/null || true", container_root);
+     system(cmd);
+     snprintf(cmd, sizeof(cmd), "cp /usr/share/terminfo/x/xterm-256color %s/usr/share/terminfo/x/ 2>/dev/null || true", container_root);
+     system(cmd);
+     snprintf(cmd, sizeof(cmd), "cp /usr/share/terminfo/v/vt100 %s/usr/share/terminfo/v/ 2>/dev/null || true", container_root);
+     system(cmd);
      
      // 如果上述都失敗，從 /lib/terminfo 複製 (某些系統的位置)
-     system("cp /lib/terminfo/l/linux " CONTAINER_ROOT "/lib/terminfo/l/linux 2>/dev/null || true");
-     system("cp /lib/terminfo/x/xterm " CONTAINER_ROOT "/lib/terminfo/x/xterm 2>/dev/null || true");
-
+     snprintf(cmd, sizeof(cmd), "cp /lib/terminfo/l/linux %s/lib/terminfo/l/linux 2>/dev/null || true", container_root);
+     system(cmd);
+     snprintf(cmd, sizeof(cmd), "cp /lib/terminfo/x/xterm %s/lib/terminfo/x/xterm 2>/dev/null || true", container_root);
+     system(cmd);
 
     // 複製 terminfo 資料庫 (讓 top, htop 等能正常顯示)
-    system("mkdir -p " CONTAINER_ROOT "/usr/share/terminfo");
-    system("cp -r /usr/share/terminfo/* " CONTAINER_ROOT "/usr/share/terminfo/ 2>/dev/null || true");
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/usr/share/terminfo", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "cp -r /usr/share/terminfo/* %s/usr/share/terminfo/ 2>/dev/null || true", container_root);
+    system(cmd);
 }
 
 
-void clear_copy(){
-         // 創建簡單的清屏腳本（直接使用 ANSI 轉義序列）
-         FILE *clear_script = fopen(CONTAINER_ROOT "/bin/clear_alt", "w");
-         if (clear_script) {
-             fprintf(clear_script, "#!/bin/bash\n");
-             fprintf(clear_script, "printf '\\033[2J\\033[H'\n");
-             fclose(clear_script);
-             chmod(CONTAINER_ROOT "/bin/clear_alt", 0755);
-         }
-         
-         // 創建 cls 別名
-         system("ln -sf /bin/clear_alt " CONTAINER_ROOT "/bin/cls 2>/dev/null || true");
-         
-         // 覆蓋原有的 clear 指令，使其使用簡單的 ANSI 轉義序列
-         FILE *clear_main = fopen(CONTAINER_ROOT "/bin/clear", "w");
-         if (clear_main) {
-             fprintf(clear_main, "#!/bin/bash\n");
-             fprintf(clear_main, "printf '\\033[2J\\033[H'\n");
-             fclose(clear_main);
-             chmod(CONTAINER_ROOT "/bin/clear", 0755);
-         }
-}
-
- void device_copy(){
-      // 創建一些必要的設備文件
-      system("mknod " CONTAINER_ROOT "/dev/null c 1 3 2>/dev/null || true");
-      system("mknod " CONTAINER_ROOT "/dev/zero c 1 5 2>/dev/null || true");
-      system("mknod " CONTAINER_ROOT "/dev/random c 1 8 2>/dev/null || true");
-      system("mknod " CONTAINER_ROOT "/dev/urandom c 1 9 2>/dev/null || true");
-      system("mknod " CONTAINER_ROOT "/dev/tty c 5 0 2>/dev/null || true");
-      system("mknod " CONTAINER_ROOT "/dev/console c 5 1 2>/dev/null || true");
-      
-      // 複製當前終端設備到容器中
-      system("cp -a /dev/pts " CONTAINER_ROOT "/dev/ 2>/dev/null || true");
-      system("chmod 666 " CONTAINER_ROOT "/dev/null " CONTAINER_ROOT "/dev/zero " CONTAINER_ROOT "/dev/tty " CONTAINER_ROOT "/dev/console 2>/dev/null || true");
- }
-
-void lib_copy(){
-        // 複製重要的庫文件
-        printf("正在安裝系統庫...\n");
-        system("cp -r /lib/x86_64-linux-gnu/* " CONTAINER_ROOT "/lib/x86_64-linux-gnu/ 2>/dev/null || true");
-        system("cp -r /usr/lib/x86_64-linux-gnu/* " CONTAINER_ROOT "/usr/lib/x86_64-linux-gnu/ 2>/dev/null || true");
-        system("cp /lib64/ld-linux-x86-64.so.* " CONTAINER_ROOT "/lib64/ 2>/dev/null || true");
-
-         // 創建基本的 /etc 文件
-        system("echo 'root:x:0:0:root:/root:/bin/bash' > " CONTAINER_ROOT "/etc/passwd");
-        system("echo 'root:x:0:' > " CONTAINER_ROOT "/etc/group");
-        system("echo 'container' > " CONTAINER_ROOT "/etc/hostname");
-}
-
-void vim_copy(){
+// 創建基本的系統文件（/etc/passwd, /etc/group, /etc/hostname）
+void create_basic_system_files(const char* container_root) {
+    char cmd[1024];
+    char path[512];
+    FILE* file;
     
+    // 創建 /etc/passwd
+    snprintf(path, sizeof(path), "%s/etc/passwd", container_root);
+    file = fopen(path, "w");
+    if (file) {
+        fprintf(file, "root:x:0:0:root:/root:/bin/bash\n");
+        fprintf(file, "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n");
+        fclose(file);
+    }
+    
+    // 創建 /etc/group
+    snprintf(path, sizeof(path), "%s/etc/group", container_root);
+    file = fopen(path, "w");
+    if (file) {
+        fprintf(file, "root:x:0:\n");
+        fprintf(file, "nogroup:x:65534:\n");
+        fclose(file);
+    }
+    
+    // 創建 /etc/hostname
+    snprintf(path, sizeof(path), "%s/etc/hostname", container_root);
+    file = fopen(path, "w");
+    if (file) {
+        fprintf(file, "container\n");
+        fclose(file);
+    }
+    
+    // 複製基本的系統庫
+    snprintf(cmd, sizeof(cmd), "cp -r /lib/x86_64-linux-gnu/* %s/lib/x86_64-linux-gnu/ 2>/dev/null || true", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "cp -r /usr/lib/x86_64-linux-gnu/* %s/usr/lib/x86_64-linux-gnu/ 2>/dev/null || true", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "cp /lib64/ld-linux-x86-64.so.* %s/lib64/ 2>/dev/null || true", container_root);
+    system(cmd);
+}
+
+// 創建清屏腳本
+void clear_copy(const char* container_root){
+    char path[512];
+    FILE *file;
+    
+    // 創建簡單的清屏腳本（直接使用 ANSI 轉義序列）
+    snprintf(path, sizeof(path), "%s/bin/clear_alt", container_root);
+    file = fopen(path, "w");
+    if (file) {
+        fprintf(file, "#!/bin/bash\n");
+        fprintf(file, "printf '\\033[2J\\033[H'\n");
+        fclose(file);
+        chmod(path, 0755);
+    }
+    
+    // 創建 cls 別名（符號連結）
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "ln -sf /bin/clear_alt %s/bin/cls 2>/dev/null || true", container_root);
+    system(cmd);
+    
+    // 覆蓋原有的 clear 指令
+    snprintf(path, sizeof(path), "%s/bin/clear", container_root);
+    file = fopen(path, "w");
+    if (file) {
+        fprintf(file, "#!/bin/bash\n");
+        fprintf(file, "printf '\\033[2J\\033[H'\n");
+        fclose(file);
+        chmod(path, 0755);
+    }
+}
+
+// 創建設備文件
+void device_copy(const char* container_root){
+    char cmd[1024];
+    
+    // 創建一些必要的設備文件
+    snprintf(cmd, sizeof(cmd), "mknod %s/dev/null c 1 3 2>/dev/null || true", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "mknod %s/dev/zero c 1 5 2>/dev/null || true", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "mknod %s/dev/random c 1 8 2>/dev/null || true", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "mknod %s/dev/urandom c 1 9 2>/dev/null || true", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "mknod %s/dev/tty c 5 0 2>/dev/null || true", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "mknod %s/dev/console c 5 1 2>/dev/null || true", container_root);
+    system(cmd);
+    
+    // 複製當前終端設備到容器中
+    snprintf(cmd, sizeof(cmd), "cp -a /dev/pts %s/dev/ 2>/dev/null || true", container_root);
+    system(cmd);
+    
+    // 設置設備文件權限
+    snprintf(cmd, sizeof(cmd), "chmod 666 %s/dev/null %s/dev/zero %s/dev/tty %s/dev/console 2>/dev/null || true",
+             container_root, container_root, container_root, container_root);
+    system(cmd);
+}
+
+// 複製 vim 配置和運行時文件
+void vim_copy(const char* container_root){
+    char cmd[1024];
+    char path[512];
+    FILE *file;
     
     // 複製 vim 運行時文件
-    // printf("正在安裝 vim 支援...\n");
-    system("mkdir -p " CONTAINER_ROOT "/usr/share/vim");
-    system("cp -r /usr/share/vim/vim* " CONTAINER_ROOT "/usr/share/vim/ 2>/dev/null || true");
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/usr/share/vim", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "cp -r /usr/share/vim/vim* %s/usr/share/vim/ 2>/dev/null || true", container_root);
+    system(cmd);
     
-    // 創建簡單的 vimrc 配置文件來避免錯誤
-    system("mkdir -p " CONTAINER_ROOT "/etc/vim");
-    system("echo 'set nocompatible' > " CONTAINER_ROOT "/etc/vim/vimrc");
-    system("echo 'set backspace=indent,eol,start' >> " CONTAINER_ROOT "/etc/vim/vimrc");
-    system("echo 'syntax on' >> " CONTAINER_ROOT "/etc/vim/vimrc");
-    system("echo 'set background=dark' >> " CONTAINER_ROOT "/etc/vim/vimrc");
-    system("echo 'set number' >> " CONTAINER_ROOT "/etc/vim/vimrc");
+    // 創建 vim 配置目錄
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/etc/vim", container_root);
+    system(cmd);
+    
+    // 創建簡單的 vimrc 配置文件
+    snprintf(path, sizeof(path), "%s/etc/vim/vimrc", container_root);
+    file = fopen(path, "w");
+    if (file) {
+        fprintf(file, "set nocompatible\n");
+        fprintf(file, "set backspace=indent,eol,start\n");
+        fprintf(file, "syntax on\n");
+        fprintf(file, "set background=dark\n");
+        fprintf(file, "set number\n");
+        fclose(file);
+    }
     
     // 創建用戶級別的 vimrc
-    system("mkdir -p " CONTAINER_ROOT "/root");
-    system("echo 'set nocompatible' > " CONTAINER_ROOT "/root/.vimrc");
-    system("echo 'set backspace=indent,eol,start' >> " CONTAINER_ROOT "/root/.vimrc");
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/root", container_root);
+    system(cmd);
+    
+    snprintf(path, sizeof(path), "%s/root/.vimrc", container_root);
+    file = fopen(path, "w");
+    if (file) {
+        fprintf(file, "set nocompatible\n");
+        fprintf(file, "set backspace=indent,eol,start\n");
+        fclose(file);
+    }
 }
 
 // 複製指令和其依賴庫的函數
-void copy_command_with_libs(const char* cmd_path, const char* dest_name) {
+void copy_command_with_libs(const char* cmd_path, const char* dest_name, const char* container_root) {
     char copy_cmd[512];
     char lib_cmd[1024];
     
     // 複製指令本身
     snprintf(copy_cmd, sizeof(copy_cmd), 
-             "cp %s " CONTAINER_ROOT "/bin/%s 2>/dev/null && chmod +x " CONTAINER_ROOT "/bin/%s", 
-             cmd_path, dest_name, dest_name);
+             "cp %s %s/bin/%s 2>/dev/null && chmod +x %s/bin/%s", 
+             cmd_path, container_root, dest_name, container_root, dest_name);
     system(copy_cmd);
     
     // 複製指令需要的庫文件
     snprintf(lib_cmd, sizeof(lib_cmd),
              "ldd %s 2>/dev/null | grep -o '/lib[^ ]*' | while read lib; do "
              "if [ -f \"$lib\" ]; then "
-             "mkdir -p " CONTAINER_ROOT "/$(dirname \"$lib\") 2>/dev/null; "
-             "cp \"$lib\" " CONTAINER_ROOT "/\"$lib\" 2>/dev/null; "
-             "fi; done", cmd_path);
+             "mkdir -p %s/$(dirname \"$lib\") 2>/dev/null; "
+             "cp \"$lib\" %s/\"$lib\" 2>/dev/null; "
+             "fi; done", cmd_path, container_root, container_root);
     system(lib_cmd);
 }
 
-//man instruction copy to container
- void man_command_copy(){
-         
+// 複製 man 指令及其相關文件
+void man_command_copy(const char* container_root){
+    char cmd[1024];
+    
     // 複製 man-db 相關的庫文件
-    system("cp /usr/lib/man-db/libmandb-*.so " CONTAINER_ROOT "/usr/lib/x86_64-linux-gnu/ 2>/dev/null || true");
-    system("mkdir -p " CONTAINER_ROOT "/usr/lib/man-db");
-    system("cp /usr/lib/man-db/* " CONTAINER_ROOT "/usr/lib/man-db/ 2>/dev/null || true");
+    snprintf(cmd, sizeof(cmd), "cp /usr/lib/man-db/libmandb-*.so %s/usr/lib/x86_64-linux-gnu/ 2>/dev/null || true", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/usr/lib/man-db", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "cp /usr/lib/man-db/* %s/usr/lib/man-db/ 2>/dev/null || true", container_root);
+    system(cmd);
     
     // 複製 man-db 的輔助程序及其依賴
-    system("mkdir -p " CONTAINER_ROOT "/usr/libexec/man-db");
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/usr/libexec/man-db", container_root);
+    system(cmd);
     
     // 複製並設置權限
     char *man_helpers[] = {
@@ -367,30 +537,32 @@ void copy_command_with_libs(const char* cmd_path, const char* dest_name) {
     };
     
     for (int i = 0; man_helpers[i]; i++) {
-        char cmd[512];
+        char helper_cmd[1024];
         // 複製程序本身
-        snprintf(cmd, sizeof(cmd), 
-                "cp %s " CONTAINER_ROOT "/usr/libexec/man-db/ 2>/dev/null && chmod +x " CONTAINER_ROOT "/usr/libexec/man-db/$(basename %s)",
-                man_helpers[i], man_helpers[i]);
-        system(cmd);
+        snprintf(helper_cmd, sizeof(helper_cmd), 
+                "cp %s %s/usr/libexec/man-db/ 2>/dev/null && chmod +x %s/usr/libexec/man-db/$(basename %s)",
+                man_helpers[i], container_root, container_root, man_helpers[i]);
+        system(helper_cmd);
         
         // 複製其依賴庫
-        snprintf(cmd, sizeof(cmd),
+        snprintf(helper_cmd, sizeof(helper_cmd),
                 "ldd %s 2>/dev/null | grep -o '/lib[^ ]*' | while read lib; do "
                 "if [ -f \"$lib\" ]; then "
-                "mkdir -p " CONTAINER_ROOT "/$(dirname \"$lib\"); "
-                "cp \"$lib\" " CONTAINER_ROOT "/\"$lib\" 2>/dev/null; "
+                "mkdir -p %s/$(dirname \"$lib\"); "
+                "cp \"$lib\" %s/\"$lib\" 2>/dev/null; "
                 "fi; done",
-                man_helpers[i]);
-        system(cmd);
+                man_helpers[i], container_root, container_root);
+        system(helper_cmd);
     }
     
     
     // 複製 man 頁面文檔（選擇性複製常用的）
-    // printf("正在安裝 man 手冊...\n");
-    system("mkdir -p " CONTAINER_ROOT "/usr/share/man/man1");
-    system("mkdir -p " CONTAINER_ROOT "/usr/share/man/man5");
-    system("mkdir -p " CONTAINER_ROOT "/usr/share/man/man8");
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/usr/share/man/man1", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/usr/share/man/man5", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/usr/share/man/man8", container_root);
+    system(cmd);
     
     // 複製常用指令的 man 頁面
     char *man_pages[] = {
@@ -400,34 +572,45 @@ void copy_command_with_libs(const char* cmd_path, const char* dest_name) {
     };
     
     for (int i = 0; man_pages[i]; i++) {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), 
-                "cp /usr/share/man/man1/%s.1.gz " CONTAINER_ROOT "/usr/share/man/man1/ 2>/dev/null || true",
-                man_pages[i]);
-        system(cmd);
+        char page_cmd[1024];
+        snprintf(page_cmd, sizeof(page_cmd), 
+                "cp /usr/share/man/man1/%s.1.gz %s/usr/share/man/man1/ 2>/dev/null || true",
+                man_pages[i], container_root);
+        system(page_cmd);
     }
     
     // 複製 man 的配置文件
-    system("cp /etc/manpath.config " CONTAINER_ROOT "/etc/ 2>/dev/null || true");
+    snprintf(cmd, sizeof(cmd), "cp /etc/manpath.config %s/etc/ 2>/dev/null || true", container_root);
+    system(cmd);
     
     // 複製 groff 資料文件 (man 需要這些來格式化文檔)
-    // printf("正在安裝 groff 支援...\n");
-    system("mkdir -p " CONTAINER_ROOT "/usr/share/groff");
-    system("cp -r /usr/share/groff/* " CONTAINER_ROOT "/usr/share/groff/ 2>/dev/null || true");
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/usr/share/groff", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "cp -r /usr/share/groff/* %s/usr/share/groff/ 2>/dev/null || true", container_root);
+    system(cmd);
     
     // 複製 groff 的字體文件
-    system("mkdir -p " CONTAINER_ROOT "/usr/share/groff/current");
-    system("cp -r /usr/share/groff/current/* " CONTAINER_ROOT "/usr/share/groff/current/ 2>/dev/null || true");
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/usr/share/groff/current", container_root);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "cp -r /usr/share/groff/current/* %s/usr/share/groff/current/ 2>/dev/null || true", container_root);
+    system(cmd);
 }
 
-void set_alias(){
-        // 創建簡單的 bashrc 來設置別名
-        system("echo 'alias cls=clear_alt' > " CONTAINER_ROOT "/etc/bash.bashrc");
-        system("echo 'alias ll=\"ls -la\"' >> " CONTAINER_ROOT "/etc/bash.bashrc");
-        system("echo 'export TERM=xterm' >> " CONTAINER_ROOT "/etc/bash.bashrc");
-        system("echo 'export TERMINFO=/usr/share/terminfo:/lib/terminfo:/etc/terminfo' >> " CONTAINER_ROOT "/etc/bash.bashrc");
+// 設置 bash 別名和環境變量
+void set_alias(const char* container_root){
+    char path[512];
+    FILE *file;
     
-    
+    // 創建簡單的 bashrc 來設置別名
+    snprintf(path, sizeof(path), "%s/etc/bash.bashrc", container_root);
+    file = fopen(path, "w");
+    if (file) {
+        fprintf(file, "alias cls=clear_alt\n");
+        fprintf(file, "alias ll=\"ls -la\"\n");
+        fprintf(file, "export TERM=xterm\n");
+        fprintf(file, "export TERMINFO=/usr/share/terminfo:/lib/terminfo:/etc/terminfo\n");
+        fclose(file);
+    }
 }
 
 // 創建虛擬的 meminfo 文件以反映 cgroup 限制（在 chroot 後調用）
@@ -467,7 +650,10 @@ void create_virtual_meminfo_after_chroot(long memory_limit_mb) {
 
 // 容器初始化函數
 int container_init(void* arg) {
-    cgroup_limits_t* limits = (cgroup_limits_t*)arg;
+    container_init_args_t* args = (container_init_args_t*)arg;
+    cgroup_limits_t* limits = args->limits;
+    const char* container_root = args->container_root;
+    
     // 使用 -i 參數強制 bash 進入交互模式
     char *argv[] = {"/bin/bash", "-i", NULL};
     char *envp[] = {
@@ -479,14 +665,35 @@ int container_init(void* arg) {
         NULL
     };
     
-    (void)arg;  // 避免未使用參數的警告
+    // 關閉管道的寫入端（父進程使用）
+    close(args->sync_pipe[1]);
     
-    printf("=== 進入容器環境 ===\n");
+    // 等待父進程完成 uid_map 和 gid_map 的設置
+    char ch;
+    if (read(args->sync_pipe[0], &ch, 1) != 1) {
+        fprintf(stderr, "等待父進程設置映射時失敗\n");
+    }
+    close(args->sync_pipe[0]);
+    
+    // 在用戶命名空間中設置 UID/GID 為 0（必須在 uid_map 設置後立即執行）
+    // 這樣後續創建的所有文件和目錄都會有正確的權限
+    if (setgid(0) == -1) {
+        perror("setgid");
+        return -1;
+    }
+    if (setuid(0) == -1) {
+        perror("setuid");
+        return -1;
+    }
+    
+    printf("=== 進入容器環境 (ID: %d) ===\n", args->container_id);
     printf("PID: %d\n", getpid());
     printf("PPID: %d\n", getppid());
+    printf("UID: %d, GID: %d\n", getuid(), getgid());
+    printf("容器根目錄: %s\n", container_root);
     
     // 創建容器根目錄
-    if (mkdir(CONTAINER_ROOT, 0755) == -1 && errno != EEXIST) {
+    if (mkdir(container_root, 0755) == -1 && errno != EEXIST) {
         perror("mkdir container_root");
         return -1;
     }
@@ -504,7 +711,7 @@ int container_init(void* arg) {
     
     for (int i = 0; dirs[i]; i++) {
         char path[256];
-        snprintf(path, sizeof(path), "%s/%s", CONTAINER_ROOT, dirs[i]);
+        snprintf(path, sizeof(path), "%s/%s", container_root, dirs[i]);
         if (mkdir(path, 0755) == -1 && errno != EEXIST) {
             // 忽略錯誤
         }
@@ -541,6 +748,7 @@ int container_init(void* arg) {
         {"/bin/sort", "sort"},
         {"/bin/uniq", "uniq"},
         {"/bin/dd", "dd"},
+        {"/bin/touch", "touch"},
         {"/usr/bin/yes", "yes"},
         {"/usr/bin/seq", "seq"},
         {"/usr/bin/bc", "bc"},
@@ -585,29 +793,37 @@ int container_init(void* arg) {
     
     for (int i = 0; basic_commands[i].source_path; i++) {
         if (access(basic_commands[i].source_path, F_OK) == 0) {
-            copy_command_with_libs(basic_commands[i].source_path, basic_commands[i].dest_name);
+            copy_command_with_libs(basic_commands[i].source_path, basic_commands[i].dest_name, container_root);
             // printf("  已安裝: %s\n", basic_commands[i].dest_name);
         }
     }
 
-    terminfo_copy();
-
-    lib_copy();
-
-    man_command_copy();
-
-    set_alias();
-     
-    clear_copy();
-
-    device_copy();
-
-    vim_copy();
+    // 創建基本系統文件（必須在 chroot 之前）
+    printf("正在創建基本系統文件...\n");
+    create_basic_system_files(container_root);
+    
+    printf("正在安裝終端支援...\n");
+    terminfo_copy(container_root);
+    
+    printf("正在創建設備文件...\n");
+    device_copy(container_root);
+    
+    printf("正在設置別名...\n");
+    set_alias(container_root);
+    
+    printf("正在安裝清屏腳本...\n");
+    clear_copy(container_root);
+    
+    // 可選：安裝 vim 和 man（較慢，可根據需要啟用）
+    // printf("正在安裝 vim 支援...\n");
+    // vim_copy(container_root);
+    // printf("正在安裝 man 手冊...\n");
+    // man_command_copy(container_root);
     
     // 文件系統隔離：改變根目錄並切換工作目錄
     // chroot: 將進程的根目錄改為容器目錄，實現文件系統隔離
     // chdir: 切換到新的根目錄，避免工作目錄錯誤
-    if (chroot(CONTAINER_ROOT) == -1 || chdir("/") == -1) {
+    if (chroot(container_root) == -1 || chdir("/") == -1) {
         perror("文件系統隔離失敗");
         return -1;
     }
@@ -661,6 +877,11 @@ int main() {
     printf("=== 簡單容器實現 ===\n");
     printf("正在創建容器...\n");
     
+    // 生成唯一的容器 ID（使用當前時間戳和進程ID）
+    int container_id = (int)time(NULL) % 100000 + getpid() % 1000;
+    
+    printf("容器 ID: %d\n", container_id);
+    
     // 配置資源限制
     static cgroup_limits_t limits = {
         .memory_limit_mb = 512,    // 限制記憶體為 512 MB
@@ -669,6 +890,23 @@ int main() {
         .pids_max = 100            // 最多 100 個進程
     };
     
+    // 創建用於同步的管道
+    static container_init_args_t args;
+    args.limits = &limits;
+    args.container_id = container_id;
+    
+    // 生成唯一的容器根目錄和 cgroup 名稱
+    snprintf(args.container_root, sizeof(args.container_root), "%s%d", CONTAINER_ROOT_PREFIX, container_id);
+    snprintf(args.cgroup_name, sizeof(args.cgroup_name), "%s%d", CGROUP_NAME_PREFIX, container_id);
+    
+    printf("容器根目錄: %s\n", args.container_root);
+    printf("Cgroup 名稱: %s\n\n", args.cgroup_name);
+    
+    if (pipe(args.sync_pipe) == -1) {
+        perror("pipe");
+        exit(EXIT_FAILURE);
+    }
+    
     // 創建子進程，使用新的命名空間
     pid_t pid = clone(container_init, 
                       child_stack + STACK_SIZE,
@@ -676,18 +914,31 @@ int main() {
                       CLONE_NEWNS |     // 新的掛載命名空間
                       CLONE_NEWUTS |    // 新的主機名命名空間
                       CLONE_NEWIPC |    // 新的 IPC 命名空間
+                      CLONE_NEWUSER |   // 新的用戶命名空間
                       SIGCHLD,          // 子進程結束時發送 SIGCHLD
-                      &limits);         // 傳遞限制配置
+                      &args);           // 傳遞參數結構
     
     if (pid == -1) {
         perror("clone");
         exit(EXIT_FAILURE);
     }
     
+    // 關閉管道的讀取端（子進程使用）
+    close(args.sync_pipe[0]);
+    
     printf("容器已創建，PID: %d\n\n", pid);
     
+    // 設置用戶命名空間映射
+    if (setup_user_namespace(pid) == -1) {
+        fprintf(stderr, "警告: 用戶命名空間設置失敗，但容器將繼續運行\n");
+    }
+    printf("\n");
+    
+    // 通知子進程映射已完成，可以繼續執行
+    close(args.sync_pipe[1]);
+    
     // 設置資源限制
-    setup_cgroup_limits(pid, &limits);
+    setup_cgroup_limits(pid, &limits, args.cgroup_name);
     printf("\n");
     
     // 等待子進程結束
@@ -700,12 +951,16 @@ int main() {
     printf("容器已退出\n");
     
     // 清理 cgroup
-    cleanup_cgroup();
+    cleanup_cgroup(args.cgroup_name);
     
     // 清理容器目錄
-    if (system("rm -rf " CONTAINER_ROOT) == -1) {
+    char cleanup_cmd[512];
+    snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rm -rf %s", args.container_root);
+    printf("正在清理容器目錄: %s\n", args.container_root);
+    if (system(cleanup_cmd) == -1) {
         perror("清理容器目錄");
     }
     
+    printf("容器 %d 清理完成\n", container_id);
     return 0;
 }
