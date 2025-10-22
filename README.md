@@ -4,13 +4,21 @@
 
 ## 功能特性
 
+### 核心功能
 - ✅ **進程隔離**: 使用 PID 命名空間隔離進程
 - ✅ **文件系統隔離**: 使用 chroot 和掛載命名空間
 - ✅ **主機名隔離**: 使用 UTS 命名空間
 - ✅ **IPC 隔離**: 使用 IPC 命名空間
+- ✅ **用戶隔離**: 使用用戶命名空間（USER namespace）進行權限隔離
 - ✅ **資源限制**: 使用 cgroups 限制 CPU、記憶體和進程數
+- ✅ **多容器支持**: 可同時運行多個獨立容器
+
+### 環境和工具
 - ✅ **完整的基本指令集**: ls, cat, ps, top, htop, grep, find, vim, nano, man 等
 - ✅ **終端支援**: 完整的 terminfo 和 devpts 支援
+- ✅ **設備文件**: /dev/null, /dev/zero, /dev/random 等
+- ✅ **系統文件**: /etc/passwd, /etc/group, /etc/hostname
+- ✅ **Bash 配置**: 別名、環境變量、清屏腳本
 
 ## 編譯
 
@@ -20,9 +28,29 @@ make
 
 ## 運行
 
+### 單容器模式
 ```bash
 sudo ./main
 ```
+
+### 多容器模式
+可以在多個終端同時啟動多個容器：
+```bash
+# 終端 1
+sudo ./main
+
+# 終端 2
+sudo ./main
+
+# 終端 3
+sudo ./main
+```
+
+每個容器都有：
+- 唯一的容器 ID
+- 獨立的根目錄 `/tmp/container_root_<ID>`
+- 獨立的 cgroup `docker_in_c_container_<ID>`
+- 完全隔離的命名空間
 ## 已安裝的指令
 
 ### 基本文件操作
@@ -49,15 +77,17 @@ sudo ./main
 ## 實現原理
 
 1. 使用 `clone()` 系統調用創建帶有新命名空間的子進程
-2. 設置 cgroups 資源限制（CPU、記憶體、進程數）
-3. 在子進程中設置容器根目錄和基本文件系統結構
-4. 使用 `chroot()` 改變根目錄實現文件系統隔離
-5. 掛載必要的文件系統（proc, sys, devpts）
-6. 執行 /bin/bash
+2. 設置用戶命名空間 UID/GID 映射，實現權限隔離
+3. 設置 cgroups 資源限制（CPU、記憶體、進程數）
+4. 在子進程中設置容器根目錄和基本文件系統結構
+5. 使用 `chroot()` 改變根目錄實現文件系統隔離
+6. 掛載必要的文件系統（proc, sys, devpts）
+7. 執行 /bin/bash
 
 ## 技術細節
 
-- **命名空間**: CLONE_NEWPID, CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWIPC
+- **命名空間**: CLONE_NEWPID, CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWUSER
+- **用戶映射**: 將容器內的 root (UID 0) 映射到主機當前用戶，提供安全隔離
 - **資源限制**: cgroups v1/v2 自動檢測和配置
   - 記憶體限制: 512 MB
   - CPU 配額: 50% (可配置)
@@ -105,15 +135,49 @@ ps aux
 top
 ```
 
+## 測試功能
+
+### 快速測試
+```bash
+# 在容器內執行
+id                          # 查看用戶身份
+whoami                      # 應顯示 root
+cat /proc/self/uid_map      # 查看 UID 映射
+ls -la /etc/passwd          # 查看系統文件
+echo test > /tmp/test.txt   # 測試文件操作
+clear                       # 測試清屏
+```
+
+
+
+### 測試用戶命名空間映射
+```bash
+# 在容器內創建文件
+touch /tmp/usertest
+ls -la /tmp/usertest        # 顯示所有者為 root
+
+# 在主機查看（另一個終端）
+ls -la /tmp/container_root_*/tmp/usertest
+# 顯示所有者為 paulboul1013 (1000) ✓
+```
+
 ## 限制
 
 這是一個簡化的實現，不包含以下功能：
 - 網路隔離（CLONE_NEWNET）
-- 用戶命名空間（CLONE_NEWUSER）
 - 安全性加強（seccomp, AppArmor）
 - 鏡像管理
 - 持久化存儲（volumes）
 
+
+## 專案結構
+
+```
+docker_in_c/
+├── main.c                      # 主程式源代碼
+├── Makefile                    # 編譯配置
+├── README.md                   # 本文件
+```
 
 ## 作者
 
