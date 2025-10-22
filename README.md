@@ -56,24 +56,6 @@ sudo ./main
 ### 基本文件操作
 - ls, cat, cp, mv, rm, mkdir, find, grep, pwd
 
-### 系統監控
-- top, htop, ps, free, uptime, df, du
-
-### 文本編輯
-- vim, nano, less, more
-
-### 文本處理
-- head, tail, sort, uniq, wc, grep
-
-### 網路工具
-- curl, wget
-
-### 壓縮工具
-- tar, gzip, gunzip, zcat
-
-### 其他工具
-- man, which, whoami, id, env, clear, sleep
-
 ## 實現原理
 
 1. 使用 `clone()` 系統調用創建帶有新命名空間的子進程
@@ -145,7 +127,7 @@ whoami                      # 應顯示 root
 cat /proc/self/uid_map      # 查看 UID 映射
 ls -la /etc/passwd          # 查看系統文件
 echo test > /tmp/test.txt   # 測試文件操作
-clear                       # 測試清屏
+clear                       # 清屏
 ```
 
 
@@ -176,11 +158,10 @@ ls -la /tmp/container_root_*/tmp/usertest
 docker_in_c/
 ├── main.c                      # 主程式源代碼
 ├── Makefile                    # 編譯配置
-├── README.md                   # 本文件
+├── README.md                   # 說明文件
 ```
 
 ## 作者
-
 paulboul1013
 
 
