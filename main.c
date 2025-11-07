@@ -4,6 +4,7 @@
 #include <sys/wait.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sched.h>
 #include <signal.h>
 #include <string.h>
@@ -31,11 +32,49 @@ typedef struct {
     int container_id;          // 容器 ID
 } container_init_args_t;
 
+// 創建基本的設備文件（當 devtmpfs 掛載失敗時的備用方案）
+static void create_basic_devices(const char* container_root) {
+    char dev_path[512];
+    snprintf(dev_path, sizeof(dev_path), "%s/dev", container_root);
+    mkdir(dev_path, 0755);
+    
+    // 創建基本設備文件
+    struct {
+        const char* name;
+        mode_t mode;
+        dev_t dev;
+    } devices[] = {
+        {"/dev/null", S_IFCHR | 0666, makedev(1, 3)},
+        {"/dev/zero", S_IFCHR | 0666, makedev(1, 5)},
+        {"/dev/random", S_IFCHR | 0666, makedev(1, 8)},
+        {"/dev/urandom", S_IFCHR | 0666, makedev(1, 9)},
+        {"/dev/tty", S_IFCHR | 0666, makedev(5, 0)},
+        {"/dev/console", S_IFCHR | 0600, makedev(5, 1)},
+        {"/dev/full", S_IFCHR | 0666, makedev(1, 7)},
+    };
+    
+    for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); ++i) {
+        char device_path[512];
+        snprintf(device_path, sizeof(device_path), "%s%s", container_root, devices[i].name);
+        
+        // 如果文件已存在，先刪除
+        unlink(device_path);
+        
+        // 創建設備文件
+        if (mknod(device_path, devices[i].mode, devices[i].dev) == -1) {
+            // 靜默失敗，因為這只是備用方案
+            // fprintf(stderr, "警告: 無法創建設備 %s: %s\n", device_path, strerror(errno));
+        } else {
+            chmod(device_path, devices[i].mode & 0777);
+        }
+    }
+}
+
 // 創建虛擬的 meminfo 文件以反映 cgroup 限制
 void create_virtual_meminfo(const char* path, long memory_limit_mb) {
     FILE* meminfo = fopen(path, "w");
     if (!meminfo) {
-        fprintf(stderr, "警告: 無法創建虛擬 meminfo: %s\n", path);
+        // fprintf(stderr, "警告: 無法創建虛擬 meminfo: %s (錯誤: %s)\n", path, strerror(errno));
         return;
     }
     
@@ -90,7 +129,7 @@ int container_init(void* arg) {
     // 等待父進程完成 uid_map 和 gid_map 的設置
     char ch;
     if (read(args->sync_pipe[0], &ch, 1) != 1) {
-        fprintf(stderr, "等待父進程設置映射時失敗\n");
+        // fprintf(stderr, "等待父進程設置映射時失敗\n");
     }
     close(args->sync_pipe[0]);
     
@@ -105,11 +144,11 @@ int container_init(void* arg) {
         return -1;
     }
     
-    printf("=== 進入容器環境 (ID: %d) ===\n", args->container_id);
-    printf("PID: %d\n", getpid());
-    printf("PPID: %d\n", getppid());
-    printf("UID: %d, GID: %d\n", getuid(), getgid());
-    printf("容器根目錄: %s\n\n", container_root);
+    // printf("=== 進入容器環境 (ID: %d) ===\n", args->container_id);
+    // printf("PID: %d\n", getpid());
+    // printf("PPID: %d\n", getppid());
+    // printf("UID: %d, GID: %d\n", getuid(), getgid());
+    // printf("容器根目錄: %s\n\n", container_root);
     
     // 使用基礎 rootfs 設置容器文件系統（快速！）
     // 模式選擇：
@@ -121,12 +160,60 @@ int container_init(void* arg) {
         return -1;
     }
     
+    // 在 chroot 之前，將主機的關鍵設備文件 bind mount 到容器路徑
+    const char* device_paths[] = {"/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty", "/dev/console"};
+    for (size_t i = 0; i < sizeof(device_paths) / sizeof(device_paths[0]); ++i) {
+        char target_path[512];
+        snprintf(target_path, sizeof(target_path), "%s%s", container_root, device_paths[i]);
+        // 確保目標文件存在
+        int fd = open(target_path, O_CREAT | O_WRONLY, 0666);
+        if (fd != -1) close(fd);
+        if (mount(device_paths[i], target_path, NULL, MS_BIND, NULL) == -1) {
+            fprintf(stderr, "警告: 無法綁定設備 %s -> %s: %s\n", device_paths[i], target_path, strerror(errno));
+        } else {
+            chmod(target_path, 0666);
+        }
+    }
+
     // 在 chroot 之前創建虛擬 meminfo（在主機文件系統）
     if (limits && limits->memory_limit_mb > 0) {
         char meminfo_path[512];
+        char tmp_dir[512];
+        
+        // 確保 /tmp 目錄存在
+        snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", container_root);
+        mkdir(tmp_dir, 0777);
+        chmod(tmp_dir, 01777);  // 設置 sticky bit
+        
         snprintf(meminfo_path, sizeof(meminfo_path), "%s/tmp/meminfo.custom", container_root);
         create_virtual_meminfo(meminfo_path, limits->memory_limit_mb);
     }
+    
+    // 在 chroot 之前掛載 devtmpfs 到容器的 /dev 目錄
+    char dev_path[512];
+    snprintf(dev_path, sizeof(dev_path), "%s/dev", container_root);
+    mkdir(dev_path, 0755);
+    if (mount("devtmpfs", dev_path, "devtmpfs", 0, NULL) == -1) {
+        // 在用戶命名空間中，devtmpfs 掛載可能失敗，使用備用方案：手動創建基本設備文件
+        // fprintf(stderr, "警告: 無法掛載 devtmpfs 到 %s: %s，使用備用方案創建設備文件\n", dev_path, strerror(errno));
+        create_basic_devices(container_root);
+    }
+    
+    // 在 chroot 之前掛載 devpts 到容器的 /dev/pts 目錄
+    char devpts_path[512];
+    snprintf(devpts_path, sizeof(devpts_path), "%s/dev/pts", container_root);
+    mkdir(devpts_path, 0755);
+    if (mount("devpts", devpts_path, "devpts", MS_NOSUID | MS_NOEXEC, "ptmxmode=0666,newinstance") == -1) {
+        if (mount("devpts", devpts_path, "devpts", MS_NOSUID | MS_NOEXEC, NULL) == -1) {
+            fprintf(stderr, "警告: 無法掛載 devpts 到 %s: %s\n", devpts_path, strerror(errno));
+        }
+    }
+    
+    // 創建 /dev/ptmx 的符號連結（在 chroot 之前）
+    char ptmx_link[512];
+    snprintf(ptmx_link, sizeof(ptmx_link), "%s/dev/ptmx", container_root);
+    unlink(ptmx_link); // 如果已存在則刪除
+    symlink("/dev/pts/ptmx", ptmx_link);
     
     // 文件系統隔離：改變根目錄並切換工作目錄
     // chroot: 將進程的根目錄改為容器目錄，實現文件系統隔離
@@ -141,37 +228,63 @@ int container_init(void* arg) {
         // printf("警告: 無法掛載 /proc (某些指令如 top 可能無法正常工作)\n");
     }
     
+    // 確保 /dev/pts 正確掛載（在 chroot 後驗證並重新掛載）
+    // 先嘗試卸載可能存在的舊掛載
+    umount("/dev/pts");
+    mkdir("/dev/pts", 0755);
+    if (mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "ptmxmode=0666,newinstance") == -1) {
+        if (mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, NULL) == -1) {
+            fprintf(stderr, "警告: 無法在 chroot 後掛載 /dev/pts: %s\n", strerror(errno));
+        }
+    }
+    
+    // 確保 /dev/ptmx 符號連結存在
+    unlink("/dev/ptmx"); // 如果已存在則刪除
+    symlink("/dev/pts/ptmx", "/dev/ptmx");
+    
+    // 確保 /var/lib/dpkg/info/format 檔案是 2.0（在 chroot 後強制設置）
+    // 先確保目錄存在
+    mkdir("/var/lib/dpkg", 0755);
+    mkdir("/var/lib/dpkg/info", 0755);
+    
+    char format_path[512] = "/var/lib/dpkg/info/format";
+    unlink(format_path); // 刪除可能存在的舊檔案
+    FILE* format_file = fopen(format_path, "w");
+    if (format_file) {
+        fprintf(format_file, "2.0\n");
+        fclose(format_file);
+        chmod(format_path, 0644);
+    }
+    
+    char format_new_path[512] = "/var/lib/dpkg/info/format-new";
+    unlink(format_new_path); // 刪除可能存在的舊檔案
+    format_file = fopen(format_new_path, "w");
+    if (format_file) {
+        fprintf(format_file, "2.0\n");
+        fclose(format_file);
+        chmod(format_new_path, 0644);
+    }
+    
     // 掛載虛擬 meminfo（已在 chroot 之前創建）
     if (limits && limits->memory_limit_mb > 0) {
         // 檢查 meminfo 文件是否存在
         if (access("/tmp/meminfo.custom", F_OK) != 0) {
-            printf("⚠️  警告: 虛擬 meminfo 文件不存在\n");
+            // printf("⚠️  警告: 虛擬 meminfo 文件不存在\n");
         } else {
             // 使用 bind mount 將虛擬 meminfo 掛載到 /proc/meminfo
             if (mount("/tmp/meminfo.custom", "/proc/meminfo", NULL, MS_BIND, NULL) == -1) {
-                printf("⚠️  警告: 無法掛載虛擬 meminfo: %s\n", strerror(errno));
-                printf("    提示: free 命令將顯示主機記憶體，但 cgroup 限制仍然生效\n");
+                // printf("⚠️  警告: 無法掛載虛擬 meminfo: %s\n", strerror(errno));
+                // printf("    提示: free 命令將顯示主機記憶體，但 cgroup 限制仍然生效\n");
             } else {
-                printf("✅ 已設置虛擬記憶體視圖: %ld MB\n", limits->memory_limit_mb);
+                // printf("✅ 已設置虛擬記憶體視圖: %ld MB\n", limits->memory_limit_mb);
             }
         }
     }
     
-    
-    // 掛載 devpts (偽終端設備，對 top/htop 等交互式程式很重要)
-    mkdir("/dev/pts", 0755);
-    if (mount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=0666") == -1) {
-        // 如果新實例失敗，嘗試不帶參數掛載
-        if (mount("devpts", "/dev/pts", "devpts", 0, NULL) == -1) {
-            printf("警告: 無法掛載 /dev/pts (終端交互可能受影響)\n");
-        }
-    }
-    
-    // 創建 /dev/ptmx 的符號連結
-    symlink("/dev/pts/ptmx", "/dev/ptmx");
-    
-    printf("\n容器環境已準備就緒！\n");
-    printf("輸入 'exit' 離開容器\n\n");
+    // devtmpfs 和 devpts 已在 chroot 之前掛載
+
+    // printf("\n容器環境已準備就緒！\n");
+    // printf("輸入 'exit' 離開容器\n\n");
     
     // 執行 bash
     if (execve("/bin/bash", argv, envp) == -1) {
@@ -184,7 +297,6 @@ int container_init(void* arg) {
 
 
 int main() {
-    printf("=== 簡單容器實現 ===\n\n");
     
     // 檢查並創建基礎 rootfs（如果需要）
     if (!check_base_rootfs_exists()) {
@@ -207,21 +319,21 @@ int main() {
             return 1;
         }
     } else {
-        printf("✓ 找到基礎容器映像: %s\n\n", BASE_ROOTFS_PATH);
+        // printf("✓ 找到基礎容器映像: %s\n\n", BASE_ROOTFS_PATH);
     }
     
-    printf("正在創建容器...\n");
+    // printf("正在創建容器...\n");
     
     // 生成唯一的容器 ID（使用當前時間戳和進程ID）
     int container_id = (int)time(NULL) % 100000 + getpid() % 1000;
     
-    printf("容器 ID: %d\n", container_id);
+    // printf("容器 ID: %d\n", container_id);
     
     // 配置資源限制
     static cgroup_limits_t limits = {
-        .memory_limit_mb = 512,    // 限制記憶體為 512 MB
-        .cpu_shares = 512,         // CPU 份額為 512 (預設的一半)
-        .cpu_quota_us = 50000,     // CPU 配額為 50% (50000/100000)
+        .memory_limit_mb = 1024,    // 限制記憶體為 512 MB
+        .cpu_shares = 1024,         // CPU 份額為 512 (預設的一半)
+        .cpu_quota_us = 100000,     // CPU 配額為 50% (50000/100000)
         .pids_max = 100            // 最多 100 個進程
     };
     
@@ -234,8 +346,8 @@ int main() {
     snprintf(args.container_root, sizeof(args.container_root), "%s%d", CONTAINER_ROOT_PREFIX, container_id);
     snprintf(args.cgroup_name, sizeof(args.cgroup_name), "%s%d", CGROUP_NAME_PREFIX, container_id);
     
-    printf("容器根目錄: %s\n", args.container_root);
-    printf("Cgroup 名稱: %s\n\n", args.cgroup_name);
+    // printf("容器根目錄: %s\n", args.container_root);
+    // printf("Cgroup 名稱: %s\n\n", args.cgroup_name);
     
     if (pipe(args.sync_pipe) == -1) {
         perror("pipe");
@@ -261,20 +373,20 @@ int main() {
     // 關閉管道的讀取端（子進程使用）
     close(args.sync_pipe[0]);
     
-    printf("容器已創建，PID: %d\n\n", pid);
+    // printf("容器已創建，PID: %d\n\n", pid);
     
     // 設置用戶命名空間映射
     if (setup_user_namespace(pid) == -1) {
         fprintf(stderr, "警告: 用戶命名空間設置失敗，但容器將繼續運行\n");
     }
-    printf("\n");
+    // printf("\n");
     
     // 通知子進程映射已完成，可以繼續執行
     close(args.sync_pipe[1]);
     
     // 設置資源限制
     setup_cgroup_limits(pid, &limits, args.cgroup_name);
-    printf("\n");
+    // printf("\n");
     
     // 等待子進程結束
     int status;
@@ -294,6 +406,20 @@ int main() {
     printf("正在清理容器目錄: %s\n", args.container_root);
     if (system(cleanup_cmd) == -1) {
         perror("清理容器目錄");
+    }
+
+    // 清理 OverlayFS 產生的 upper/work 目錄
+    char overlay_cleanup_cmd[1024];
+    char upper_dir[512], work_dir[512];
+    snprintf(upper_dir, sizeof(upper_dir), "%s_upper", args.container_root);
+    snprintf(work_dir, sizeof(work_dir), "%s_work", args.container_root);
+    snprintf(overlay_cleanup_cmd, sizeof(overlay_cleanup_cmd), "rm -rf %s", upper_dir);
+    if (system(overlay_cleanup_cmd) == -1) {
+        perror("清理 OverlayFS 目錄");
+    }
+    snprintf(overlay_cleanup_cmd, sizeof(overlay_cleanup_cmd), "rm -rf %s", work_dir);
+    if (system(overlay_cleanup_cmd) == -1) {
+        perror("清理 OverlayFS 目錄");
     }
     
     printf("容器 %d 清理完成\n", container_id);

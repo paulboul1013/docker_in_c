@@ -69,5 +69,11 @@ void vim_copy(const char* container_root);
  */
 void man_command_copy(const char* container_root);
 
+/**
+ * 複製 apt-get 及其相關工具和配置
+ * @param container_root 容器根目錄
+ */
+void apt_get_copy(const char* container_root);
+
 #endif // ROOTFS_H
 

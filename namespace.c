@@ -31,7 +31,7 @@ int setup_user_namespace(pid_t pid) {
     uid_t real_uid = get_real_uid();
     gid_t real_gid = get_real_gid();
     
-    printf("正在設置用戶命名空間映射...\n");
+    // printf("正在設置用戶命名空間映射...\n");
     
     // 禁用 setgroups（安全要求）
     snprintf(path, sizeof(path), "/proc/%d/setgroups", pid);
@@ -59,7 +59,7 @@ int setup_user_namespace(pid_t pid) {
         return -1;
     }
     fclose(file);
-    printf("  UID 映射: 容器 0 -> 主機 %d\n", real_uid);
+    // printf("  UID 映射: 容器 0 -> 主機 %d\n", real_uid);
     
     // 設置 GID 映射
     snprintf(path, sizeof(path), "/proc/%d/gid_map", pid);
@@ -77,7 +77,7 @@ int setup_user_namespace(pid_t pid) {
         return -1;
     }
     fclose(file);
-    printf("  GID 映射: 容器 0 -> 主機 %d\n", real_gid);
+    // printf("  GID 映射: 容器 0 -> 主機 %d\n", real_gid);
     
     return 0;
 }
