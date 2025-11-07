@@ -319,7 +319,7 @@ int main() {
             return 1;
         }
     } else {
-        // printf("✓ 找到基礎容器映像: %s\n\n", BASE_ROOTFS_PATH);
+        printf(" 找到基礎容器映像: %s\n\n", BASE_ROOTFS_PATH);
     }
     
     // printf("正在創建容器...\n");
@@ -331,9 +331,9 @@ int main() {
     
     // 配置資源限制
     static cgroup_limits_t limits = {
-        .memory_limit_mb = 1024,    // 限制記憶體為 512 MB
-        .cpu_shares = 1024,         // CPU 份額為 512 (預設的一半)
-        .cpu_quota_us = 100000,     // CPU 配額為 50% (50000/100000)
+        .memory_limit_mb = 512,    // 限制記憶體為 512 MB
+        .cpu_shares = 512,         // CPU 份額為 512 (預設的一半)
+        .cpu_quota_us = 50000,     // CPU 配額為 50% (50000/100000)
         .pids_max = 100            // 最多 100 個進程
     };
     

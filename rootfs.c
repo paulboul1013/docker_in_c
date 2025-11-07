@@ -736,6 +736,7 @@ int create_base_rootfs(void) {
         {"/usr/bin/clear", "clear"},
         {"/usr/bin/more", "more"},
         {"/usr/bin/vim", "vim"},
+        {"/usr/bin/ping", "ping"},
         {"/usr/bin/nano", "nano"},
         {"/usr/bin/curl", "curl"},
         {"/usr/bin/wget", "wget"},
